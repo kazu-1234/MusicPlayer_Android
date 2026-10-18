@@ -12,6 +12,11 @@
     <!-- Foreground Service用 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <application
         android:allowBackup="true"
@@ -46,7 +51,13 @@
             android:name=".MusicScanService"
             android:foregroundServiceType="dataSync"
             android:exported="false" />
-        
+
+        <!-- PC（Windows 版）からの同期を受け取る Foreground Service (v3.0.0) -->
+        <service
+            android:name=".sync.SyncReceiverService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+
         <!-- 音楽再生通知用BroadcastReceiver -->
         <receiver 
             android:name=".MusicNotificationReceiver"

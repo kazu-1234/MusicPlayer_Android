@@ -18,11 +18,13 @@ M3Uプレイリストの読み込みや、古いファイルでよくある文�
 * システム連携: ロック画面や通知パネルにある、Android標準のメディアプレイヤーからの操作にも対応しています。
 * ソート・検索機能: 曲名、アーティスト、アルバム、再生回数での並び替えはもちろん、文字入力での絞り込み検索もできます。
 * アルバムアートのキャッシュ: メモリとディスクの両方にキャッシュを保存することで、曲リストを高速にスクロールできるように工夫しました。
+* オンライン歌詞表示: Lrclib.netから歌詞を取得して表示します（キャッシュ対応）。タイムスタンプ付き歌詞(LRC)は再生に合わせて自動でスクロールします。
+* PCからの一方向同期: Windows版MusicPlayerから、同じネットワーク経由で音楽ファイルとプレイリスト(.m3u)を受信できます。受信待機をオンにして、初回だけ画面に出る6桁の番号でペアリングします。
 * アプリ内アップデート: GitHubのReleases機能と連動させていて、アプリの中から直接新しいバージョンを確認してダウンロードできます。
 
 ## インストール方法
 
-Releasesページ (https://github.com/kazu-1234/MusicPlayer/releases) から最新の app-release.apk をダウンロードして、Android端末にインストールしてください。
+Releasesページ (https://github.com/kazu-1234/MusicPlayer_Android/releases) から最新の MusicPlayer_Android-vX.Y.Z.apk をダウンロードして、Android端末にインストールしてください。
 ※ インストールするときに「提供元不明のアプリ」の許可を求められることがあります。
 
 ## 開発環境・使用技術
@@ -41,7 +43,7 @@ Releasesページ (https://github.com/kazu-1234/MusicPlayer/releases) から最�
 ## ビルド方法
 
 1. このリポジトリをクローンします。
-   `git clone https://github.com/kazu-1234/MusicPlayer.git`
+   `git clone https://github.com/kazu-1234/MusicPlayer_Android.git`
 2. Android Studioでプロジェクトを開きます。
 3. Gradleの同期が終わったら、Runボタンを押して実機やエミュレータでビルドして実行してください。
 

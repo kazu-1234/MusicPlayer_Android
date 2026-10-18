@@ -17,6 +17,11 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import android.content.pm.ServiceInfo
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 
 /**
  * 音楽再生用Foreground Service
@@ -35,6 +40,10 @@ class MusicPlaybackService : Service() {
         const val ACTION_STOP = "com.example.musicplayer.ACTION_STOP"
         const val ACTION_NEXT = "com.example.musicplayer.ACTION_NEXT"
         const val ACTION_PREVIOUS = "com.example.musicplayer.ACTION_PREVIOUS"
+        
+        // Settings
+        private const val PREFS_NAME = "MusicPlayerPrefs"
+        private const val KEY_USE_SYSTEM_MEDIA_CONTROLLER = "useSystemMediaController"
     }
     
     // バインダー
@@ -42,6 +51,9 @@ class MusicPlaybackService : Service() {
     
     // MediaPlayer
     private var mediaPlayer: MediaPlayer? = null
+    
+    // MediaSession
+    private lateinit var mediaSession: MediaSessionCompat
     
     // 再生状態
     var isPlaying = false
@@ -75,6 +87,21 @@ class MusicPlaybackService : Service() {
     
     override fun onCreate() {
         super.onCreate()
+        
+        // MediaSession初期化 (v2.5.6)
+        mediaSession = MediaSessionCompat(this, "MusicPlaybackSession").apply {
+            setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS)
+            setCallback(object : MediaSessionCompat.Callback() {
+                override fun onPlay() { resume() }
+                override fun onPause() { pause() }
+                override fun onSkipToNext() { playNext() }
+                override fun onSkipToPrevious() { playPrevious() }
+                override fun onStop() { stop() }
+                override fun onSeekTo(pos: Long) { seekTo(pos.toInt()) }
+            })
+            isActive = true
+        }
+
         createNotificationChannel()
         
         // WakeLock取得（CPU維持）
@@ -103,6 +130,7 @@ class MusicPlaybackService : Service() {
     
     override fun onDestroy() {
         super.onDestroy()
+        mediaSession.release() // MediaSession解放
         mediaPlayer?.release()
         mediaPlayer = null
         wakeLock?.let {
@@ -153,7 +181,7 @@ class MusicPlaybackService : Service() {
             )
         }
         
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(song?.title ?: "再生中")
             .setContentText(song?.artist ?: "Unknown Artist")
@@ -169,11 +197,62 @@ class MusicPlaybackService : Service() {
                 "次へ",
                 createPendingIntent(ACTION_NEXT)
             )
-            .setStyle(androidx.media.app.NotificationCompat.MediaStyle()
-                .setShowActionsInCompactView(0, 1, 2))
             .setOngoing(isPlaying)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .build()
+
+        // 設定を確認してMediaSessionを適用
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val useSystemMediaController = prefs.getBoolean(KEY_USE_SYSTEM_MEDIA_CONTROLLER, true)
+        
+        if (useSystemMediaController) {
+            builder.setStyle(androidx.media.app.NotificationCompat.MediaStyle()
+                .setMediaSession(mediaSession.sessionToken)
+                .setShowActionsInCompactView(0, 1, 2))
+        } else {
+            builder.setStyle(androidx.media.app.NotificationCompat.MediaStyle()
+                .setShowActionsInCompactView(0, 1, 2))
+        }
+            
+        return builder.build()
+    }
+    
+    private fun updateMediaSessionState() {
+        if (!::mediaSession.isInitialized) return
+        
+        val state = if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
+        val position = mediaPlayer?.currentPosition?.toLong() ?: 0L
+        val playbackSpeed = if (isPlaying) 1.0f else 0.0f
+        
+        mediaSession.setPlaybackState(
+            PlaybackStateCompat.Builder()
+                .setActions(
+                    PlaybackStateCompat.ACTION_PLAY or
+                    PlaybackStateCompat.ACTION_PAUSE or
+                    PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+                    PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                    PlaybackStateCompat.ACTION_STOP or
+                    PlaybackStateCompat.ACTION_SEEK_TO
+                )
+                .setState(state, position, playbackSpeed)
+                .build()
+        )
+    }
+
+    private fun updateMediaMetadata() {
+        if (!::mediaSession.isInitialized) return
+        val song = currentSong ?: return
+        
+        val metadataBuilder = MediaMetadataCompat.Builder()
+            .putString(MediaMetadataCompat.METADATA_KEY_TITLE, song.title)
+            .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, song.artist)
+            .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, song.album)
+            .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, song.duration)
+        
+        // アルバムアートは非同期読み込みが必要なため、ここでは簡易的に省略するか、
+        // 必要に応じてBitmapFactoryで読み込む（時間かかるので注意）
+        // いったんメタデータのみ更新
+        
+        mediaSession.setMetadata(metadataBuilder.build())
     }
     
     private fun createPendingIntent(action: String): PendingIntent {
@@ -243,6 +322,10 @@ class MusicPlaybackService : Service() {
         // Foreground Service開始
         startForegroundService()
         
+        // MediaSession更新 (v2.5.6)
+        updateMediaMetadata()
+        updateMediaSessionState()
+        
         // コールバック
         onPlaybackStateChanged?.invoke(true)
         onSongChanged?.invoke(song)
@@ -277,7 +360,9 @@ class MusicPlaybackService : Service() {
         mediaPlayer?.pause()
         isPlaying = false
         onPlaybackStateChanged?.invoke(false)
+        onPlaybackStateChanged?.invoke(false)
         updateNotification()
+        updateMediaSessionState() // MediaSession更新
         
         // WakeLock解放
         wakeLock?.let {
@@ -292,7 +377,9 @@ class MusicPlaybackService : Service() {
         mediaPlayer?.start()
         isPlaying = true
         onPlaybackStateChanged?.invoke(true)
+        onPlaybackStateChanged?.invoke(true)
         updateNotification()
+        updateMediaSessionState() // MediaSession更新
         
         // WakeLock再取得
         wakeLock?.let {
@@ -320,6 +407,9 @@ class MusicPlaybackService : Service() {
             if (it.isHeld) it.release()
         }
         
+        mediaSession.isActive = false // MediaSession無効化
+        updateMediaSessionState()
+        
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
     
@@ -328,6 +418,7 @@ class MusicPlaybackService : Service() {
      */
     fun seekTo(position: Int) {
         mediaPlayer?.seekTo(position)
+        updateMediaSessionState() // 位置更新
     }
     
     /**

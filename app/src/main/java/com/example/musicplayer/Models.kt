@@ -11,6 +11,7 @@ data class Song(
     var playCount: Int = 0, 
     val trackNumber: Int, 
     val sourceFolderUri: Uri,
+    val duration: Long = 0L,
     val exists: Boolean = true
 )
 

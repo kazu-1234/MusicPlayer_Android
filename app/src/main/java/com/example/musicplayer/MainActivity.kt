@@ -54,10 +54,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.automirrored.filled.Subject
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DragHandle
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Refresh
@@ -67,6 +70,11 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Sync
+import com.example.musicplayer.sync.SyncPaths
+import com.example.musicplayer.sync.SyncReceiverService
+import com.example.musicplayer.sync.SyncScreen
+import com.example.musicplayer.sync.SyncStore
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Shuffle
@@ -105,9 +113,9 @@ import java.io.File
 import java.util.Collections
 
 // --- アプリ情報 ---
-// v2.5.3: スキャンクラッシュ修正 & バックグラウンドサービス化
-private const val APP_VERSION = "v2.5.3"
-private const val GEMINI_MODEL_VERSION = "Final Build 2026-01-15 v71"
+// v2.5.4: スキャンクラッシュ修正 & バックグラウンドサービス統合
+private const val APP_VERSION = "v3.1.0"
+private const val GEMINI_MODEL_VERSION = "Final Build 2026-01-15 v72"
 
 // --- アルバムアートキャッシュ (v2.5.0: 永続化対応) ---
 object AlbumArtCache {
@@ -436,18 +444,39 @@ class MainActivity : ComponentActivity() {
 sealed class Screen {
     object Main : Screen()
     object Settings : Screen()
+    object Sync : Screen()
 }
 
 // ヘルパー関数: サービス起動
 fun startScanServiceHelper(context: Context, uris: List<Uri>) {
+    val readableUris = filterReadableUris(context, uris)
+    if (readableUris.isEmpty()) {
+        Toast.makeText(context, "フォルダの読み取り権限が失われています。再選択してください", Toast.LENGTH_SHORT).show()
+        return
+    }
     val intent = Intent(context, MusicScanService::class.java).apply {
         action = MusicScanService.ACTION_START_SCAN
-        putParcelableArrayListExtra(MusicScanService.EXTRA_SCAN_URIS, ArrayList(uris))
+        putParcelableArrayListExtra(MusicScanService.EXTRA_SCAN_URIS, ArrayList(readableUris))
     }
     if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
         context.startForegroundService(intent)
     } else {
         context.startService(intent)
+    }
+}
+
+private fun filterReadableUris(context: Context, uris: List<Uri>): List<Uri> {
+    val resolver = context.contentResolver
+    val persisted = resolver.persistedUriPermissions
+    return uris.filter { uri ->
+        val hasPersisted = persisted.any { it.uri == uri && it.isReadPermission }
+        val hasGrant = context.checkUriPermission(
+            uri,
+            android.os.Process.myPid(),
+            android.os.Process.myUid(),
+            Intent.FLAG_GRANT_READ_URI_PERMISSION
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        hasPersisted || hasGrant
     }
 }
 
@@ -462,22 +491,56 @@ fun MusicApp(useSystemMediaController: Boolean, onUseSystemMediaControllerChange
     val coroutineScope = rememberCoroutineScope()
     var scanProgress by remember { mutableFloatStateOf(0f) }
     var scanCount by remember { mutableIntStateOf(0) }
+    var scanTotal by remember { mutableIntStateOf(0) }
     var isScanning by remember { mutableStateOf(false) }
+    // PC からの同期の完了後に再スキャンしているフォルダ（スキャン完了の受信処理で、通常の追加ではなく入れ替えをするため）
+    var syncApplyRoot by remember { mutableStateOf<Uri?>(null) }
+
+    // スキャン中は画面スリープを防止
+    DisposableEffect(isScanning) {
+        val activity = context as? Activity
+        if (isScanning) {
+            activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
 
     // Scan Service Receiver
     DisposableEffect(Unit) {
         val scanReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
+                    MusicScanService.ACTION_SCAN_STARTED_BROADCAST -> {
+                        isScanning = true
+                        scanProgress = 0f
+                        scanCount = 0
+                        scanTotal = 0
+                    }
                     MusicScanService.ACTION_SCAN_PROGRESS -> {
                         scanProgress = intent.getFloatExtra(MusicScanService.EXTRA_PROGRESS, 0f)
                         scanCount = intent.getIntExtra(MusicScanService.EXTRA_CURRENT_COUNT, 0)
+                        scanTotal = intent.getIntExtra(MusicScanService.EXTRA_TOTAL_COUNT, 0) // Total count from service
                         isScanning = true
                     }
                     MusicScanService.ACTION_SCAN_COMPLETE -> {
                         isScanning = false
                         val newSongs = ScanResultHolder.scannedSongs
-                        if (!newSongs.isNullOrEmpty()) {
+                        val applyRoot = syncApplyRoot
+                        if (applyRoot != null) {
+                            // PC からの同期後の再スキャン（v3.0.0）: 同期先フォルダの曲を入れ替え、届いたプレイリストを反映する
+                            syncApplyRoot = null
+                            ScanResultHolder.scannedSongs = null
+                            coroutineScope.launch {
+                                val (songs, lists) = applySyncResult(context!!, applyRoot, songList, newSongs.orEmpty())
+                                songList = songs
+                                playlists = lists
+                                Toast.makeText(context, "PC からの同期を反映しました", Toast.LENGTH_SHORT).show()
+                            }
+                        } else if (!newSongs.isNullOrEmpty()) {
                             songList = (songList + newSongs).distinctBy { it.uri }.sortedBy { it.title }
                             ScanResultHolder.scannedSongs = null // Clear memory
                             Toast.makeText(context, "${newSongs.size}曲を追加しました", Toast.LENGTH_SHORT).show()
@@ -490,6 +553,7 @@ fun MusicApp(useSystemMediaController: Boolean, onUseSystemMediaControllerChange
             }
         }
         val filter = android.content.IntentFilter().apply {
+            addAction(MusicScanService.ACTION_SCAN_STARTED_BROADCAST)
             addAction(MusicScanService.ACTION_SCAN_PROGRESS)
             addAction(MusicScanService.ACTION_SCAN_COMPLETE)
         }
@@ -506,6 +570,16 @@ fun MusicApp(useSystemMediaController: Boolean, onUseSystemMediaControllerChange
     var libraryUpdateKey by remember { mutableStateOf(0) }
     // val context = LocalContext.current (Removed duplicate)
 
+    // ───── PC からの同期の反映 (v3.0.0) ─────
+    val receiverState by SyncReceiverService.state.collectAsState()
+    // 同期が完了するたび（completedCount が増えるたび）と、起動時に反映待ちが残っていたときに再スキャンする
+    LaunchedEffect(receiverState.completedCount) {
+        if (!SyncStore.isPendingApply(context) || isScanning) return@LaunchedEffect
+        val root = SyncStore.syncRoot(context) ?: return@LaunchedEffect
+        syncApplyRoot = root
+        startScanServiceHelper(context, listOf(root))
+    }
+
     LaunchedEffect(libraryUpdateKey) {
         songList = loadLibraryFromFile(context) ?: emptyList()
         if (songList.isNotEmpty()) {
@@ -519,8 +593,19 @@ fun MusicApp(useSystemMediaController: Boolean, onUseSystemMediaControllerChange
             playlists = playlists,
             onSongListChange = { songList = it },
             onPlaylistsChange = { playlists = it },
-            onNavigateToSettings = { currentScreen = Screen.Settings }
+            onNavigateToSettings = { currentScreen = Screen.Settings },
+            onNavigateToSync = { currentScreen = Screen.Sync }
         )
+
+        if (currentScreen is Screen.Sync) {
+            Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                SyncScreen(
+                    onNavigateBack = { currentScreen = Screen.Main },
+                    onFolderAdded = { uri -> if (!isScanning) startScanServiceHelper(context, listOf(uri)) }
+                )
+            }
+            BackHandler { currentScreen = Screen.Main }
+        }
 
         if (currentScreen is Screen.Settings) {
             Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -530,7 +615,21 @@ fun MusicApp(useSystemMediaController: Boolean, onUseSystemMediaControllerChange
                         currentScreen = Screen.Main
                     },
                     useSystemMediaController = useSystemMediaController,
-                    onUseSystemMediaControllerChange = onUseSystemMediaControllerChange
+                    onUseSystemMediaControllerChange = onUseSystemMediaControllerChange,
+                    isScanning = isScanning,
+                    scanProgress = scanProgress,
+                    scanCount = scanCount,
+                    scanTotal = scanTotal,
+                    onStartScan = { uris -> 
+                         if (!isScanning) {
+                             startScanServiceHelper(context, uris)
+                             // Reset state locally to show immediate feedback before service broadcast?
+                             // Service broadcast is fast enough usually.
+                             scanProgress = 0f
+                             scanCount = 0
+                             isScanning = true // Optimistic update
+                         }
+                    }
                 )
             }
             BackHandler {
@@ -548,7 +647,8 @@ fun MusicPlayerScreen(
     playlists: List<Playlist>,
     onSongListChange: (List<Song>) -> Unit,
     onPlaylistsChange: (List<Playlist>) -> Unit,
-    onNavigateToSettings: () -> Unit
+    onNavigateToSettings: () -> Unit,
+    onNavigateToSync: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -569,6 +669,22 @@ fun MusicPlayerScreen(
     var isPlaying by remember { mutableStateOf(false) }
     var currentPosition by remember { mutableStateOf(0) }
     var duration by remember { mutableStateOf(0) }
+    
+    // 歌詞状態 (v2.5.6)
+    var currentLyrics by remember { mutableStateOf<LyricsResult?>(null) }
+    var isLyricsLoading by remember { mutableStateOf(false) }
+    
+    // 歌詞取得
+    LaunchedEffect(currentSong) {
+        currentLyrics = null // リセット
+        isLyricsLoading = false
+        currentSong?.let { song ->
+            isLyricsLoading = true
+            // APIから取得 (キャッシュ含む) - search APIを使用
+            currentLyrics = LyricsManager.getLyrics(context, song.artist, song.title)
+            isLyricsLoading = false
+        }
+    }
     
     // 再生キュー管理
     var playingQueue by remember { mutableStateOf<List<Song>>(emptyList()) }
@@ -716,8 +832,12 @@ fun MusicPlayerScreen(
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
                 val now = System.currentTimeMillis()
-                if (now - lastActionTime < debounceMs) {
-                    return // デバウンス: 短時間の連続アクションを無視
+                // Scan events should NOT be debounced (need real-time updates and guaranteed completion)
+                val isScanEvent = intent.action == MusicScanService.ACTION_SCAN_PROGRESS || 
+                                  intent.action == MusicScanService.ACTION_SCAN_COMPLETE
+                                  
+                if (!isScanEvent && now - lastActionTime < debounceMs) {
+                    return // デバウンス: 再生制御などの短時間の連続アクションを無視
                 }
                 lastActionTime = now
                 
@@ -759,15 +879,17 @@ fun MusicPlayerScreen(
                         MusicScanService.ACTION_SCAN_PROGRESS -> {
                             val p = intent.getFloatExtra(MusicScanService.EXTRA_PROGRESS, 0f)
                             val c = intent.getIntExtra(MusicScanService.EXTRA_CURRENT_COUNT, 0)
+                            val t = intent.getIntExtra(MusicScanService.EXTRA_TOTAL_COUNT, 0)
                             scanProgress = p
                             scanCount = c
+                            scanTotal = t
                             // Totalは推定値だが、Progressから逆算またはServiceから受け取る必要があるが...
                             // 今回は簡易的にService側でProgressしているので、そのまま表示
-                            isScanning = (p < 1.0f)
+                            isScanning = true // Only set isScanning to true if we receive progress (recovery from background)
                         }
                         MusicScanService.ACTION_SCAN_COMPLETE -> {
                             isScanning = false
-                            scanProgress = 1.0f
+                            scanProgress = 1f // Visual completion
                             // ScanResultHolderから結果を取得
                             val newSongs = ScanResultHolder.scannedSongs ?: emptyList()
                             if (newSongs.isNotEmpty()) {
@@ -820,9 +942,14 @@ fun MusicPlayerScreen(
             Toast.makeText(context, "フォルダが選択されていません", Toast.LENGTH_SHORT).show()
             return
         }
+        val readableUris = filterReadableUris(context, targetUris)
+        if (readableUris.isEmpty()) {
+            Toast.makeText(context, "フォルダの読み取り権限がありません。設定から再選択してください", Toast.LENGTH_LONG).show()
+            return
+        }
         val intent = Intent(context, MusicScanService::class.java).apply {
             action = MusicScanService.ACTION_START_SCAN
-            putParcelableArrayListExtra(MusicScanService.EXTRA_SCAN_URIS, ArrayList(targetUris))
+            putParcelableArrayListExtra(MusicScanService.EXTRA_SCAN_URIS, ArrayList(readableUris))
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
@@ -877,15 +1004,17 @@ fun MusicPlayerScreen(
                              Column {
                                  Text("Music Player")
                                  if (isScanning) {
-                                     val percent = (scanProgress * 100).toInt()
-                                     Text("読み込み中: ${percent}% (${scanCount}曲)", style = MaterialTheme.typography.bodySmall)
-                                     LinearProgressIndicator(progress = { scanProgress }, modifier = Modifier.fillMaxWidth().height(2.dp))
+                                     Text("読み込み中... (${scanCount}曲)", style = MaterialTheme.typography.bodySmall)
+                                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) // Indeterminate
                                  }
                              }
                         },
                         actions = {
                             IconButton(onClick = { isSearchActive = true }) {
                                 Icon(Icons.Default.Search, contentDescription = "Search")
+                            }
+                            IconButton(onClick = onNavigateToSync) {
+                                Icon(Icons.Default.Sync, contentDescription = "Sync")
                             }
                             IconButton(onClick = onNavigateToSettings) {
                                 Icon(Icons.Default.Settings, contentDescription = "Settings")
@@ -965,10 +1094,17 @@ fun MusicPlayerScreen(
                 animationSpec = tween(durationMillis = 200)
             )
         ) {
+            // 戻るボタンで閉じる (v2.5.6)
+            BackHandler(enabled = showFullPlayer) {
+                showFullPlayer = false
+            }
+
             currentSong?.let { song ->
                 FullScreenPlayer(
                     context = context,
                     currentSong = song,
+                    currentLyrics = currentLyrics,
+                    isLyricsLoading = isLyricsLoading,
                     isPlaying = isPlaying,
                     currentPosition = currentPosition,
                     duration = duration,
@@ -1222,6 +1358,8 @@ fun MiniPlayerBar(
 fun FullScreenPlayer(
     context: Context,
     currentSong: Song,
+    currentLyrics: LyricsResult?,
+    isLyricsLoading: Boolean,
     isPlaying: Boolean,
     currentPosition: Int,
     duration: Int,
@@ -1243,6 +1381,9 @@ fun FullScreenPlayer(
     val albumArt = rememberAlbumArt(context, currentSong.uri)
     // キュー表示用の状態
     var showQueue by remember { mutableStateOf(false) }
+    // 歌詞表示用の状態
+    var showLyrics by remember { mutableStateOf(false) }
+    
     // ドラッグ中のアイテムインデックス
     var draggedIndex by remember { mutableStateOf<Int?>(null) }
     var dragOffset by remember { mutableStateOf(0f) }
@@ -1274,7 +1415,7 @@ fun FullScreenPlayer(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .then(if (!isDragging) Modifier.animateItemPlacement() else Modifier)
+                                    .then(if (!isDragging) Modifier.animateItem() else Modifier)
                                     .offset { IntOffset(0, itemOffset) }
                                     .zIndex(if (isDragging) 1f else 0f) // ドラッグ中を最前面に
                                     .background(
@@ -1448,33 +1589,86 @@ fun FullScreenPlayer(
                 overflow = TextOverflow.Ellipsis
             )
             
-            // アーティスト名 - アルバム名 (v2.5.1)
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    currentSong.artist,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false).clickable { onArtistClick(currentSong.artist) }
+            // アーティスト名 / アルバム名 (v2.5.3: 自動調整レイアウト)
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                val constraints = maxWidth
+                val density = LocalDensity.current
+                val textMeasurer = androidx.compose.ui.text.rememberTextMeasurer()
+                val artistAlbumText = "${currentSong.artist} - ${currentSong.album}"
+                
+                val style = MaterialTheme.typography.bodyLarge
+                val measuredResult = textMeasurer.measure(
+                    text = androidx.compose.ui.text.AnnotatedString(artistAlbumText),
+                    style = style,
+                    constraints = androidx.compose.ui.unit.Constraints(maxWidth = with(density) { constraints.roundToPx() })
                 )
-                Text(
-                    " - ",
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                
+                // 1行に収まらない場合は2段表示
+                // hasVisualOverflowはmultiLineだとtrueになるので、1行制限での計測が必要だが、
+                // LayoutResultのlineCountやdidOverflowWidthで判定
+                
+                // 簡易判定: 計測された幅がコンテナ幅より小さいか？
+                // measureは制約内で折り返す可能性があるので、
+                // constraints無制限でmeasureしてwidthを見るのが確実。
+                val infiniteWidthConstraints = androidx.compose.ui.unit.Constraints(maxWidth = androidx.compose.ui.unit.Constraints.Infinity)
+                val unconstrainedResult = textMeasurer.measure(
+                    text = androidx.compose.ui.text.AnnotatedString(artistAlbumText),
+                    style = style,
+                    constraints = infiniteWidthConstraints
                 )
-                Text(
-                    currentSong.album,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false).clickable { onAlbumClick(currentSong.album) }
-                )
+                
+                // 90%を超えたら2段にする（パディングやレンダリング誤差のマージン）
+                val isOverflowing = with(density) { unconstrainedResult.size.width.toDp() } > (constraints * 0.9f)
+
+                if (!isOverflowing) {
+                    // 1行表示 (横並び)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                         Text(
+                            text = currentSong.artist,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            modifier = Modifier.clickable { onArtistClick(currentSong.artist) } // weightなし、fit content
+                        )
+                        Text(
+                            text = " - ",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = currentSong.album,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            modifier = Modifier.clickable { onAlbumClick(currentSong.album) } // weightなし
+                        )
+                    }
+                } else {
+                    // 2段表示
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            text = currentSong.artist,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.clickable { onArtistClick(currentSong.artist) }
+                        )
+                        Text(
+                            text = currentSong.album,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.clickable { onAlbumClick(currentSong.album) }
+                        )
+                    }
+                }
             }
             
             Spacer(modifier = Modifier.height(24.dp))
@@ -1570,11 +1764,24 @@ fun FullScreenPlayer(
             
             Spacer(modifier = Modifier.weight(1f))
             
-            // 右下にキューボタン
+            // ボトムコントロール（歌詞・キュー）
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End
+                horizontalArrangement = Arrangement.SpaceBetween, // 両端配置
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                // 左下: 歌詞ボタン
+                IconButton(onClick = { showLyrics = !showLyrics }) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Subject, // 歌詞アイコン代用
+                        contentDescription = "Lyrics",
+                        modifier = Modifier.size(28.dp),
+                        tint = if (showLyrics) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                // 右下: キューボタン
+
                 IconButton(onClick = { showQueue = true }) {
                     Icon(
                         Icons.AutoMirrored.Filled.List,
@@ -1586,6 +1793,139 @@ fun FullScreenPlayer(
             }
         }
     }
+
+    
+    // 歌詞オーバーレイ (最前面)
+    if (showLyrics) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.95f))
+                .clickable(enabled = false) {} // タッチ透過防止
+        ) {
+            LyricsView(
+                lyrics = currentLyrics,
+                isLoading = isLyricsLoading,
+                artist = currentSong.artist,
+                title = currentSong.title,
+                currentPosition = currentPosition,
+                onSeek = { onSeek(it.toFloat()) }, // 歌詞タップでシーク
+                onDismiss = { showLyrics = false }
+            )
+        }
+    }
+}
+
+@Composable
+fun LyricsView(
+    lyrics: LyricsResult?,
+    isLoading: Boolean,
+    artist: String,
+    title: String,
+    currentPosition: Int,
+    onSeek: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        if (isLoading) {
+            // 読み込み中 (v2.5.6)
+            Column(
+                modifier = Modifier.align(Alignment.Center),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.height(16.dp))
+                Text("歌詞を読み込み中...", style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(16.dp))
+                Button(onClick = onDismiss) { Text("閉じる") }
+            }
+        } else if (lyrics == null) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text("歌詞が見つかりません", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "検索条件:\n$artist - $title",
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(16.dp))
+                Button(onClick = onDismiss) { Text("閉じる") }
+            }
+        } else {
+            val syncedLines = remember(lyrics) { LyricsManager.parseLrc(lyrics.syncedLyrics) }
+            val hasSynced = syncedLines.isNotEmpty()
+            
+            if (hasSynced) {
+                val listState = rememberLazyListState()
+                
+                // 自動スクロール
+                LaunchedEffect(currentPosition, syncedLines) {
+                    val index = syncedLines.indexOfLast { it.timeMs <= currentPosition }
+                    if (index >= 0) {
+                        // 画面中央付近に来るようにスクロール
+                        listState.animateScrollToItem((index - 1).coerceAtLeast(0), 0)
+                    }
+                }
+                
+                LazyColumn(
+                    state = listState,
+                    contentPadding = PaddingValues(vertical = 200.dp), // 上下の余白
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    items(syncedLines.size) { index ->
+                        val line = syncedLines[index]
+                        val isCurrent = if (index == syncedLines.size - 1) {
+                            currentPosition >= line.timeMs
+                        } else {
+                            currentPosition >= line.timeMs && currentPosition < syncedLines[index + 1].timeMs
+                        }
+                        
+                        Text(
+                            text = line.text,
+                            style = if (isCurrent) MaterialTheme.typography.titleLarge else MaterialTheme.typography.bodyLarge,
+                            color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                            fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 8.dp, horizontal = 16.dp)
+                                .clickable { onSeek(line.timeMs.toInt()) }
+                        )
+                    }
+                }
+            } else {
+                // プレーンテキスト
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(32.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = lyrics.plainLyrics ?: "歌詞データがありません",
+                        style = MaterialTheme.typography.bodyLarge,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(32.dp))
+                }
+            }
+            
+            // 閉じるボタン (右上)
+            IconButton(
+                onClick = onDismiss,
+                modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)
+            ) {
+                Icon(Icons.Default.Close, "閉じる")
+            }
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1593,30 +1933,23 @@ fun FullScreenPlayer(
 fun SettingsScreen(
     onNavigateBack: () -> Unit,
     useSystemMediaController: Boolean,
-    onUseSystemMediaControllerChange: (Boolean) -> Unit
+    onUseSystemMediaControllerChange: (Boolean) -> Unit,
+    isScanning: Boolean,
+    scanProgress: Float,
+    scanCount: Int,
+    scanTotal: Int,
+    onStartScan: (List<Uri>) -> Unit
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     var sourceFolders by remember { mutableStateOf(getUriList(context, KEY_SOURCE_FOLDER_URIS)) }
     var tabOrder by remember { mutableStateOf(getTabOrder(context)) }
-    var isScanning by remember { mutableStateOf(false) }
-    var scanProgress by remember { mutableStateOf(0f) }
-    var scanCount by remember { mutableStateOf(0) }
+    // Local scan state removed - using passed state
     // プレイリスト用ベースパス設定
     var playlistBasePath by remember { mutableStateOf(getPlaylistBasePath(context)) }
-
-    // スキャン中は画面をスリープさせない
-    DisposableEffect(isScanning) {
-        val window = (context as? Activity)?.window
-        if (isScanning) {
-            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        } else {
-            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
-        onDispose {
-            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
-    }
+    // スキャン中は画面をスリープさせない (Moved to MusicApp, but kept solely for safety if used independently, 
+    // though MusicApp handles it via DisposableEffect. Removed here to avoid duplication if MusicApp handles it)
+    // Actually, MusicApp's DisposableEffect works for the whole app window, so we don't need it here.
 
     val folderPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree(),
@@ -1624,7 +1957,10 @@ fun SettingsScreen(
             treeUri?.let { uri ->
                 // 権限永続化
                 try {
-                    context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
                 } catch (e: Exception) { e.printStackTrace() }
                 
                 // フォルダリスト保存
@@ -1634,8 +1970,8 @@ fun SettingsScreen(
                     saveUriList(context, KEY_SOURCE_FOLDER_URIS, currentFolders.toList())
                     sourceFolders = currentFolders.toList() // UI更新
                     
-                    // スキャン開始 (Service)
-                    startScanServiceHelper(context, listOf(uri))
+                    // スキャン開始 (Service) via Callback
+                    onStartScan(listOf(uri))
                     
                     withContext(Dispatchers.Main) {
                         Toast.makeText(context, "バックグラウンドでスキャンを開始しました", Toast.LENGTH_SHORT).show()
@@ -1699,6 +2035,19 @@ fun SettingsScreen(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(uri.path ?: "不明なフォルダ", modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         IconButton(onClick = {
+                            if (isScanning) {
+                                // Stop scanning if running
+                                val intent = Intent(context, MusicScanService::class.java).apply {
+                                    action = MusicScanService.ACTION_CANCEL_SCAN
+                                }
+                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                    context.startForegroundService(intent)
+                                } else {
+                                    context.startService(intent)
+                                }
+                                Toast.makeText(context, "スキャンを中断しました", Toast.LENGTH_SHORT).show()
+                            }
+                            
                             coroutineScope.launch {
                                 val remainingFolders = sourceFolders.filterNot { it == uri }
                                 saveUriList(context, KEY_SOURCE_FOLDER_URIS, remainingFolders)
@@ -1712,30 +2061,19 @@ fun SettingsScreen(
 
                         IconButton(onClick = {
                             if (isScanning) return@IconButton
-                            isScanning = true
-                            scanProgress = 0f
-                            coroutineScope.launch {
-                                val currentLibrary = loadLibraryFromFile(context) ?: emptyList()
-                                val cleanLibrary = currentLibrary.filterNot { it.sourceFolderUri == uri }
-                                val count = countFilesInDirectory(context, uri)
-                                val newSongs = getAudioFilesFromDirectory(context, uri, count) { progress ->
-                                     launch(Dispatchers.Main) { 
-                                         scanProgress = progress
-                                         scanCount = (progress * count).toInt()
-                                     }
-                                }
-                                val combined = (cleanLibrary + newSongs).distinctBy { it.uri }
-                                saveLibraryToFile(context, combined)
-                                isScanning = false
-                                withContext(Dispatchers.Main) { Toast.makeText(context, "再スキャン完了: ${newSongs.size}曲", Toast.LENGTH_SHORT).show() }
-                            }
+                            // Trigger service scanning
+                            onStartScan(listOf(uri))
                         }) { Icon(Icons.Filled.Refresh, "Rescan folder") }
                     }
                 }
 
                 if (isScanning) {
-                    LinearProgressIndicator(progress = { scanProgress })
-                    Text("読み込み中... ${(scanProgress * 100).toInt()}% (${scanCount}曲)")
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) // Indeterminate
+                    Text(
+                        text = "読み込み中... (${scanCount}曲)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
                 }
                 HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
             }
@@ -1787,7 +2125,6 @@ fun SettingsScreen(
             }
             item {
                 HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-
                 // キャッシュ設定 (v2.5.0)
                 Text("ストレージ設定", style = MaterialTheme.typography.titleLarge)
                 Spacer(Modifier.height(8.dp))
@@ -2617,6 +2954,7 @@ private suspend fun saveLibraryToFile(context: Context, songs: List<Song>) = wit
             put("album", song.album)
             put("playCount", song.playCount)
             put("trackNumber", song.trackNumber)
+            put("duration", song.duration)
             put("sourceFolderUri", song.sourceFolderUri.toString())
         }
         jsonArray.put(jsonObject)
@@ -2640,6 +2978,7 @@ private suspend fun loadLibraryFromFile(context: Context): List<Song>? = withCon
                 album = jsonObject.getString("album"),
                 playCount = jsonObject.getInt("playCount"),
                 trackNumber = jsonObject.optInt("trackNumber", 0),
+                duration = jsonObject.optLong("duration", 0L),
                 sourceFolderUri = Uri.parse(jsonObject.optString("sourceFolderUri"))
             ))
         }
@@ -2690,6 +3029,7 @@ private suspend fun loadPlaylistsFromFile(context: Context, allSongs: List<Song>
                         album = "Unknown Album",
                         playCount = 0,
                         trackNumber = 0,
+                        duration = 0L,
                         sourceFolderUri = Uri.EMPTY,
                         exists = false
                     ))
@@ -2710,20 +3050,30 @@ private suspend fun countFilesInDirectory(context: Context, directoryUri: Uri): 
     // SAFでのファイルカウント
     val contentResolver = context.contentResolver
     val documentsTree = DocumentsContract.buildDocumentUriUsingTree(directoryUri, DocumentsContract.getTreeDocumentId(directoryUri))
+    val projection = arrayOf(
+        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+        DocumentsContract.Document.COLUMN_MIME_TYPE,
+        DocumentsContract.Document.COLUMN_DISPLAY_NAME
+    )
     
     fun countInDirectory(currentUri: Uri): Int {
         var localCount = 0
         try {
             val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(directoryUri, DocumentsContract.getDocumentId(currentUri))
-            contentResolver.query(childrenUri, null, null, null, null)?.use { cursor ->
+            contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val mimeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+
                 while (cursor.moveToNext()) {
-                    val docId = cursor.getString(cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID))
-                    val mimeType = cursor.getString(cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE))
-                    
+                    if (idCol == -1 || mimeCol == -1) continue
+                    val docId = cursor.getString(idCol) ?: continue
+                    val mimeType = cursor.getString(mimeCol) ?: ""
+
                     if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
                         localCount += countInDirectory(DocumentsContract.buildDocumentUriUsingTree(directoryUri, docId))
                     } else {
-                        val name = cursor.getString(cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)) ?: ""
+                        val name = if (nameCol != -1) cursor.getString(nameCol) ?: "" else ""
                         val ext = name.substringAfterLast('.', "").lowercase()
                         if (mimeType.startsWith("audio/") || mimeType == "application/ogg" || 
                             setOf("mp3", "m4a", "flac", "wav", "aac", "ogg").contains(ext)) {
@@ -2745,6 +3095,11 @@ private suspend fun getAudioFilesFromDirectory(context: Context, directoryUri: U
 
     val contentResolver = context.contentResolver
     val documentsTree = DocumentsContract.buildDocumentUriUsingTree(directoryUri, DocumentsContract.getTreeDocumentId(directoryUri))
+    val projection = arrayOf(
+        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+        DocumentsContract.Document.COLUMN_MIME_TYPE,
+        DocumentsContract.Document.COLUMN_DISPLAY_NAME
+    )
     
     // 文字化け検出関数
     fun isGarbled(s: String?): Boolean {
@@ -2781,11 +3136,16 @@ private suspend fun getAudioFilesFromDirectory(context: Context, directoryUri: U
     suspend fun traverseDirectory(currentUri: Uri, parentName: String) {
         try {
             val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(directoryUri, DocumentsContract.getDocumentId(currentUri))
-            contentResolver.query(childrenUri, null, null, null, null)?.use { cursor ->
+            contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val mimeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+
                 while (cursor.moveToNext()) {
-                    val docId = cursor.getString(cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID))
-                    val mimeType = cursor.getString(cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE))
-                    val name = cursor.getString(cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)) ?: ""
+                    if (idCol == -1 || mimeCol == -1) continue
+                    val docId = cursor.getString(idCol) ?: continue
+                    val mimeType = cursor.getString(mimeCol) ?: ""
+                    val name = if (nameCol != -1) cursor.getString(nameCol) ?: "" else ""
                     
                     if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
                         traverseDirectory(DocumentsContract.buildDocumentUriUsingTree(directoryUri, docId), name)
@@ -2796,44 +3156,49 @@ private suspend fun getAudioFilesFromDirectory(context: Context, directoryUri: U
                         if (mimeType.startsWith("audio/") || mimeType == "application/ogg" || 
                             setOf("mp3", "m4a", "flac", "wav", "aac", "ogg").contains(ext)) {
                             processedCount++
-                            // 進捗更新
                             val progress = if (totalFiles > 0) processedCount.toFloat() / totalFiles.toFloat() else 0f
                             onProgress(progress)
                             
                             var songTitle = name.substringBeforeLast('.')
                             var songArtist = "Unknown Artist"
-                            var songAlbum = parentName // デフォルトは親フォルダ名
+                            var songAlbum = parentName
                             var trackNumber = 0
+                            var duration = 0L
                             
-                            // メタデータ取得（各ファイルで新しいretrieverを使用）
                             try {
                                 val fileUri = DocumentsContract.buildDocumentUriUsingTree(directoryUri, docId)
                                 val localRetriever = MediaMetadataRetriever()
                                 try {
-                                    localRetriever.setDataSource(context, fileUri)
-                                    val extractedTitle = localRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
-                                    val extractedArtist = localRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
-                                    val extractedAlbum = localRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)
-                                    
-                                    val fixedTitle = fixEncoding(extractedTitle)
-                                    val fixedArtist = fixEncoding(extractedArtist)
-                                    val fixedAlbum = fixEncoding(extractedAlbum)
-                                    
-                                    songTitle = if (isGarbled(fixedTitle)) songTitle else (fixedTitle ?: songTitle)
-                                    songArtist = if (isGarbled(fixedArtist)) "Unknown Artist" else (fixedArtist ?: "Unknown Artist")
-                                    // アルバム名が文字化けまたは空の場合は親フォルダ名を使用
-                                    songAlbum = if (isGarbled(fixedAlbum)) parentName else (fixedAlbum ?: parentName)
-                                    
-                                    val trackString = localRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER)
-                                    trackNumber = trackString?.substringBefore("/")?.toIntOrNull() ?: 0
+                                    context.contentResolver.openFileDescriptor(fileUri, "r")?.use { pfd ->
+                                        if (pfd.fileDescriptor.valid()) {
+                                            localRetriever.setDataSource(pfd.fileDescriptor)
+                                            val extractedTitle = localRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
+                                            val extractedArtist = localRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
+                                            val extractedAlbum = localRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)
+                                            
+                                            val fixedTitle = fixEncoding(extractedTitle)
+                                            val fixedArtist = fixEncoding(extractedArtist)
+                                            val fixedAlbum = fixEncoding(extractedAlbum)
+                                            
+                                            songTitle = if (isGarbled(fixedTitle)) songTitle else (fixedTitle ?: songTitle)
+                                            songArtist = if (isGarbled(fixedArtist)) "Unknown Artist" else (fixedArtist ?: "Unknown Artist")
+                                            songAlbum = if (isGarbled(fixedAlbum)) parentName else (fixedAlbum ?: parentName)
+                                            
+                                            val trackString = localRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER)
+                                            trackNumber = trackString?.substringBefore("/")?.toIntOrNull() ?: 0
+                                            
+                                            val durationStr = localRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                                            duration = durationStr?.toLongOrNull() ?: 0L
+                                        }
+                                    }
                                 } finally {
                                     try { localRetriever.release() } catch (ignored: Exception) {}
                                 }
                             } catch (e: Exception) {
-                                 // メタデータ取得失敗時はデフォルト値（ファイル名、親フォルダ名）を使用
+                             // メタデータ取得失敗時はデフォルト値（ファイル名、親フォルダ名）を使用
                             }
 
-                            songList.add(Song(DocumentsContract.buildDocumentUriUsingTree(directoryUri, docId), name, songTitle, songArtist, songAlbum, 0, trackNumber, directoryUri))
+                            songList.add(Song(DocumentsContract.buildDocumentUriUsingTree(directoryUri, docId), name, songTitle, songArtist, songAlbum, 0, trackNumber, directoryUri, duration))
                         }
                     }
                 }
@@ -2856,87 +3221,157 @@ private suspend fun getAudioFilesFromDirectory(context: Context, directoryUri: U
  */
 private suspend fun parseM3uPlaylist(context: Context, playlistUri: Uri, allSongs: List<Song>, basePath: String): Playlist? = withContext(Dispatchers.IO) {
     return@withContext runCatching {
-        val playlistSongs = mutableListOf<Song>()
         val playlistName = getFileName(context, playlistUri)?.replace(".m3u8", "")?.replace(".m3u", "") ?: "プレイリスト"
-        
-        // マッチング用のインデックスを作成
-        // ファイル名でグループ化し、重複があるかどうかを判定
-        val songsByDisplayName = allSongs.groupBy { it.displayName.lowercase() }
-        
-        // パスベースのマッチング用（フォルダ名/アルバムフォルダ/ファイル名）
-        val songsByPath = mutableMapOf<String, Song>()
-        allSongs.forEach { song ->
-            // URIからパスを抽出してキーを作成
-            val uriPath = song.uri.path ?: song.uri.toString()
-            val pathParts = uriPath.split("/").filter { it.isNotBlank() }
-            if (pathParts.size >= 3) {
-                // 最後の3パーツ（親フォルダ/アルバムフォルダ/ファイル名）でマッチング
-                val key = "${pathParts[pathParts.size - 3]}/${pathParts[pathParts.size - 2]}/${pathParts.last()}".lowercase()
-                songsByPath[key] = song
-            }
-        }
-
-        context.contentResolver.openInputStream(playlistUri)?.use { inputStream ->
-            BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8)).useLines { lines ->
-                lines.forEach { line ->
-                    if (line.isNotBlank() && !line.startsWith("#")) {
-                        val trimmedLine = line.trim()
-                        var matchedSong: Song? = null
-                        
-                        // M3Uファイルからファイル名を抽出
-                        val fileNameFromM3u = trimmedLine.substringAfterLast('/').substringAfterLast('\\').trim().lowercase()
-                        
-                        // 方法1: ファイル名でマッチング（ユニークな場合のみ）
-                        val candidatesByName = songsByDisplayName[fileNameFromM3u]
-                        if (candidatesByName != null && candidatesByName.size == 1) {
-                            // ファイル名がユニークなら直接マッチ
-                            matchedSong = candidatesByName.first()
-                        } else if (candidatesByName != null && candidatesByName.size > 1) {
-                            // 同名ファイルが複数ある場合はパスで絞り込む
-                            val pathParts = trimmedLine.replace("\\", "/").split("/").filter { it.isNotBlank() }
-                            if (pathParts.size >= 3) {
-                                val key = "${pathParts[pathParts.size - 3]}/${pathParts[pathParts.size - 2]}/${pathParts.last()}".lowercase()
-                                matchedSong = songsByPath[key]
-                            }
-                        }
-                        
-                        // 方法2: ベースパスを使ったパスマッチング（フォールバック）
-                        if (matchedSong == null && basePath.isNotBlank() && trimmedLine.startsWith(basePath, ignoreCase = true)) {
-                            val relativePath = trimmedLine.substring(basePath.length).replace("\\", "/")
-                            val pathParts = relativePath.split("/").filter { it.isNotBlank() }
-                            if (pathParts.size >= 3) {
-                                val key = "${pathParts[pathParts.size - 3]}/${pathParts[pathParts.size - 2]}/${pathParts.last()}".lowercase()
-                                matchedSong = songsByPath[key]
-                            }
-                        }
-                        
-                        if (matchedSong != null) {
-                            playlistSongs.add(matchedSong)
-                        } else {
-                            // マッチしなかった場合はプレースホルダーを作成
-                            val fileName = trimmedLine.substringAfterLast('/').substringAfterLast('\\').trim()
-                            playlistSongs.add(Song(
-                                uri = Uri.parse("file://$trimmedLine"),
-                                displayName = fileName,
-                                title = fileName.substringBeforeLast("."),
-                                artist = "不明",
-                                album = "不明",
-                                playCount = 0,
-                                trackNumber = 0,
-                                sourceFolderUri = Uri.EMPTY,
-                                exists = false
-                            ))
-                        }
-                    }
-                }
-            }
-        }
-        Playlist(playlistName, playlistSongs)
+        val lines = context.contentResolver.openInputStream(playlistUri)?.use { inputStream ->
+            BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8)).readLines()
+        }.orEmpty()
+        matchM3uLines(playlistName, lines, allSongs, basePath)
     }.onFailure {
         it.printStackTrace()
     }.getOrNull()
 }
 
+/**
+ * M3U の行を曲に読み替えてプレイリストにする（ファイル選択からの読み込みと、PC からの同期の両方で使う）。
+ * 読み替えの順: ファイル名が一意ならそれ → 同名が複数なら末尾 3 段のパス → ベースパスを外したパス → fallback。
+ * どれでも見つからない行は、存在しない曲（exists=false）として残す。
+ * @param fallback 読み替えで見つからなかった行（前後の空白を除いたもの）から曲を探す追加の手段。無ければ null を返す
+ */
+private fun matchM3uLines(
+    playlistName: String,
+    lines: List<String>,
+    allSongs: List<Song>,
+    basePath: String,
+    fallback: (String) -> Song? = { null }
+): Playlist {
+    val playlistSongs = mutableListOf<Song>()
+
+    // マッチング用のインデックスを作成
+    // ファイル名でグループ化し、重複があるかどうかを判定
+    val songsByDisplayName = allSongs.groupBy { it.displayName.lowercase() }
+    
+    // パスベースのマッチング用（フォルダ名/アルバムフォルダ/ファイル名）
+    val songsByPath = mutableMapOf<String, Song>()
+    allSongs.forEach { song ->
+        // URIからパスを抽出してキーを作成
+        val uriPath = song.uri.path ?: song.uri.toString()
+        val pathParts = uriPath.split("/").filter { it.isNotBlank() }
+        if (pathParts.size >= 3) {
+            // 最後の3パーツ（親フォルダ/アルバムフォルダ/ファイル名）でマッチング
+            val key = "${pathParts[pathParts.size - 3]}/${pathParts[pathParts.size - 2]}/${pathParts.last()}".lowercase()
+            songsByPath[key] = song
+        }
+    }
+
+    lines.forEach { line ->
+        if (line.isNotBlank() && !line.startsWith("#")) {
+            val trimmedLine = line.trim()
+            var matchedSong: Song? = null
+            
+            // M3Uファイルからファイル名を抽出
+            val fileNameFromM3u = trimmedLine.substringAfterLast('/').substringAfterLast('\\').trim().lowercase()
+            
+            // 方法1: ファイル名でマッチング（ユニークな場合のみ）
+            val candidatesByName = songsByDisplayName[fileNameFromM3u]
+            if (candidatesByName != null && candidatesByName.size == 1) {
+                // ファイル名がユニークなら直接マッチ
+                matchedSong = candidatesByName.first()
+            } else if (candidatesByName != null && candidatesByName.size > 1) {
+                // 同名ファイルが複数ある場合はパスで絞り込む
+                val pathParts = trimmedLine.replace("\\", "/").split("/").filter { it.isNotBlank() }
+                if (pathParts.size >= 3) {
+                    val key = "${pathParts[pathParts.size - 3]}/${pathParts[pathParts.size - 2]}/${pathParts.last()}".lowercase()
+                    matchedSong = songsByPath[key]
+                }
+            }
+            
+            // 方法2: ベースパスを使ったパスマッチング（フォールバック）
+            if (matchedSong == null && basePath.isNotBlank() && trimmedLine.startsWith(basePath, ignoreCase = true)) {
+                val relativePath = trimmedLine.substring(basePath.length).replace("\\", "/")
+                val pathParts = relativePath.split("/").filter { it.isNotBlank() }
+                if (pathParts.size >= 3) {
+                    val key = "${pathParts[pathParts.size - 3]}/${pathParts[pathParts.size - 2]}/${pathParts.last()}".lowercase()
+                    matchedSong = songsByPath[key]
+                }
+            }
+            
+            // 方法3: 呼び出し側の補い（同期では PC が計算した置き換え先。形式違いの MP3 など）(v3.1.0)
+            if (matchedSong == null) {
+                matchedSong = fallback(trimmedLine)
+            }
+
+            if (matchedSong != null) {
+                playlistSongs.add(matchedSong)
+            } else {
+                // マッチしなかった場合はプレースホルダーを作成
+                val fileName = trimmedLine.substringAfterLast('/').substringAfterLast('\\').trim()
+                playlistSongs.add(Song(
+                    uri = Uri.parse("file://$trimmedLine"),
+                    displayName = fileName,
+                    title = fileName.substringBeforeLast("."),
+                    artist = "不明",
+                    album = "不明",
+                    playCount = 0,
+                    trackNumber = 0,
+                    duration = 0L,
+                    sourceFolderUri = Uri.EMPTY,
+                    exists = false
+                ))
+            }
+        }
+    }
+    return Playlist(playlistName, playlistSongs)
+}
+
+/**
+ * PC からの同期の後、同期先フォルダを再スキャンした結果をライブラリとプレイリストに反映する (v3.0.0)。
+ * - 曲: 同期先フォルダ（root）由来の曲をスキャン結果で入れ替える（削除された曲が残らないように）。再生回数は URI が同じなら引き継ぐ
+ * - プレイリスト: PC から届いたものを、.m3u の読み替え（v3.1.0）または相対パス → 曲 で結び付ける。同じ名前のプレイリストは置き換え、Android にしか無いものは残す
+ * スキャン結果が 0 曲のとき（スキャン失敗など）は、曲の入れ替えはしない（ライブラリが消えないように）。
+ */
+private suspend fun applySyncResult(context: Context, root: Uri, oldSongs: List<Song>, scanned: List<Song>): Pair<List<Song>, List<Playlist>> {
+    val songs = if (scanned.isEmpty()) oldSongs else {
+        val playCounts = oldSongs.associate { it.uri.toString() to it.playCount }
+        (oldSongs.filterNot { it.sourceFolderUri == root } +
+            scanned.map { it.copy(playCount = playCounts[it.uri.toString()] ?: it.playCount) })
+            .distinctBy { it.uri }
+            .sortedBy { it.title }
+    }
+
+    val incoming = SyncStore.loadPendingPlaylists(context)
+    // メモリ上ではなくファイルから読む（起動直後でまだ読み込んでいないときに、Android だけのプレイリストを消さないため）
+    var playlists = loadPlaylistsFromFile(context, songs) ?: emptyList()
+    if (incoming.isNotEmpty()) {
+        // 相対パス（小文字）→ 曲
+        val byRelativePath = HashMap<String, Song>()
+        songs.filter { it.sourceFolderUri == root }.forEach { song ->
+            SyncPaths.relativePath(root, song.uri)?.let { byRelativePath[it.lowercase()] = song }
+        }
+        val basePath = getPlaylistBasePath(context)
+        val converted = incoming.map { p ->
+            val content = p.content
+            if (content != null) {
+                // v3.1.0: PC の .m3u の中身を「プレイリスト(.m3u)を追加」と同じ読み替えで曲に結び付ける。
+                // 読み替えで見つからない行（同期しない形式の曲など）は、PC が計算した置き換え先（相対パス）で補う
+                val lines = String(content, Charsets.UTF_8).removePrefix("﻿").lines()
+                matchM3uLines(p.name, lines, songs, basePath) { line ->
+                    p.replacements[line.lowercase()]?.let { byRelativePath[it.lowercase()] }
+                }
+            } else {
+                // 中身が届かなかったとき（古い PC 版・ファイルが読めなかった）は、相対パスの並びで結び付ける
+                Playlist(p.name, p.entries.mapNotNull { byRelativePath[it.lowercase()] })
+            }
+        }
+        playlists = playlists.map { existing -> converted.firstOrNull { it.name == existing.name } ?: existing } +
+            converted.filter { c -> playlists.none { it.name == c.name } }
+    }
+
+    saveLibraryToFile(context, songs)
+    savePlaylistsToFile(context, playlists)
+    SyncStore.clearPendingPlaylists(context)
+    SyncStore.setPendingApply(context, false)
+    return songs to playlists
+}
 
 // GitHub APIから最新リリースを確認する関数
 // GitHubリポジトリ名を設定してください
@@ -2957,8 +3392,8 @@ private suspend fun checkForUpdate(): Triple<String?, String?, String?> = withCo
         if (responseCode == 200) {
             val response = connection.inputStream.bufferedReader().use { it.readText() }
             val json = JSONObject(response)
-            val tagName = json.optString("tag_name", null)
-            val htmlUrl = json.optString("html_url", null)
+            val tagName = json.optString("tag_name").ifEmpty { null }
+            val htmlUrl = json.optString("html_url").ifEmpty { null }
             val body = json.optString("body", "") // リリースノート本文
             
             // APKアセットのダウンロードURLを探す
@@ -2969,7 +3404,7 @@ private suspend fun checkForUpdate(): Triple<String?, String?, String?> = withCo
                     val asset = assets.getJSONObject(i)
                     val name = asset.optString("name", "")
                     if (name.endsWith(".apk")) {
-                        apkUrl = asset.optString("browser_download_url", null)
+                        apkUrl = asset.optString("browser_download_url").ifEmpty { null }
                         break
                     }
                 }
